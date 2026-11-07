@@ -63,21 +63,23 @@ func newNIXLV2RequestID() (string, error) {
 	return id.String(), nil
 }
 
-func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort, kvCacheSource string, apiType reqcommon.APIType) {
+func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPodHostPort string, p2p p2pRouting, apiType reqcommon.APIType) {
 	logger := log.FromContext(r.Context())
 	logger.V(logging.DEBUG).Info("running NIXL protocol V2", "url", prefillPodHostPort, "api", apiType.String())
 
-	original, body, ok := s.readJSONBody(r, w)
+	original, body, ok := s.requestBody(r, w, p2p)
 	if !ok {
 		return
 	}
+	source := p2p.pullSource(logger)
 	// Telemetry failure must not change routing or reject an inference request.
 	toolFields, _ := captureInferenceToolCallingRequest(r, apiType, original)
 
 	// Generate unique request UUID
 	uuidStr, err := s.nixlRequestIDFn()
 	if err != nil {
-		if err := errorBadGateway(err, w); err != nil {
+		logger.Error(err, "failed to generate request ID")
+		if err := errorBadGateway(w, r); err != nil {
 			logger.Error(err, "failed to send error response to client")
 		}
 		return
@@ -90,7 +92,7 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 		transferID := "tx" + uuidStr
 		// Reuse the client snapshot when the parallel helper creates its request state.
 		r = r.WithContext(context.WithValue(r.Context(), toolCallingBaselineKey, toolFields))
-		s.runNIXLProtocolV2WriteParallel(w, r, original, body, uuidStr, transferID, prefillPodHostPort, kvCacheSource, apiType)
+		s.runNIXLProtocolV2WriteParallel(w, r, original, body, uuidStr, transferID, prefillPodHostPort, source, apiType)
 		return
 	}
 
@@ -176,13 +178,13 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 	}
 
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
-	s.addP2PPullToPrefill(logger, prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), source)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
 	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
+		if err := errorJSONInvalid(w, r, err); err != nil {
 			logger.Error(err, "failed to send error response to client")
 		}
 		return
@@ -192,7 +194,8 @@ func (s *Server) handleNIXLV2(w http.ResponseWriter, r *http.Request, prefillPod
 
 	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
 	if err != nil {
-		if err := errorBadGateway(err, w); err != nil {
+		logger.Error(err, "failed to create prefill handler")
+		if err := errorBadGateway(w, r); err != nil {
 			logger.Error(err, "failed to send error response to client")
 		}
 		return
@@ -247,7 +250,7 @@ retryLoop:
 	}
 
 	prefillDuration := time.Since(prefillStart)
-	metrics.RecordPrefillDuration(prefillDuration)
+	observeStageDuration(r.Context(), metrics.StagePrefill, prefillDuration)
 	prefillSpan.SetAttributes(
 		semconv.LLMDPDProxyPrefillStatusCode(pw.statusCode),
 		semconv.LLMDPDProxyPrefillDurationMs(float64(prefillDuration.Milliseconds())),
@@ -262,7 +265,7 @@ retryLoop:
 	}
 
 	if prefillErr == nil && isHTTPError(pw.statusCode) {
-		metrics.RecordError(metrics.StagePrefill)
+		observeStageError(r.Context(), metrics.StagePrefill)
 		logger.Error(fmt.Errorf("prefill returned %d", pw.statusCode), "prefill request failed",
 			"request_id", uuidStr,
 			logBodyBytesKey, pw.buffer.Len())
@@ -289,14 +292,14 @@ retryLoop:
 		}
 	}
 	if prefillErr != nil {
-		metrics.RecordError(metrics.StagePrefill)
+		observeStageError(r.Context(), metrics.StagePrefill)
 		logger.Error(jsonErrorForLog(prefillErr), "prefill request failed",
 			"request_id", uuidStr,
 			"status", pw.statusCode,
 			logBodyBytesKey, pw.buffer.Len())
 		prefillSpan.SetStatus(codes.Error, "prefill request failed")
 		prefillSpan.End()
-		if err := errorBadGateway(prefillErr, w); err != nil {
+		if err := errorBadGateway(w, r); err != nil {
 			logger.Error(err, "failed to send error response to client")
 		}
 		return
@@ -363,7 +366,7 @@ retryLoop:
 				if podIndex < 0 {
 					err := fmt.Errorf("cannot determine prefill pod index for %q", prefillHost)
 					logger.Error(err, "failed to route MoRI-IO decode notify", "request_id", uuidStr)
-					if err := errorBadGateway(err, w); err != nil {
+					if err := errorBadGateway(w, r); err != nil {
 						logger.Error(err, "failed to send error response to client")
 					}
 					return
@@ -443,7 +446,7 @@ retryLoop:
 
 	dbody, err := json.Marshal(body)
 	if err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
+		if err := errorJSONInvalid(w, r, err); err != nil {
 			logger.Error(err, "failed to send error response to client")
 		}
 		return
@@ -459,7 +462,7 @@ retryLoop:
 	statusWriter, decodeStatus := captureResponseStatus(w)
 	decodeWriter, finalizeDecodeWriter := decodeResponseWriter(statusWriter, pCachedTokens, rewriteCachedTokens, streamingEnabled)
 	decodeReturned := false
-	defer recordDecodeAbort(&decodeReturned, decodeStart)
+	defer recordDecodeAbort(r.Context(), &decodeReturned, decodeStart)
 	dataParallelUsed := s.forwardDataParallel && s.dataParallelHandler(decodeWriter, dreq, func() {
 		toolFields.compareValidatedDispatchedForSpan(dbody, decodeSpan)
 	})
@@ -472,17 +475,17 @@ retryLoop:
 	}
 	decodeReturned = true
 	if err := finalizeDecodeWriter(); err != nil {
-		metrics.RecordDecodeDuration(time.Since(decodeStart))
-		metrics.RecordError(metrics.StageDecode)
+		observeStageDuration(r.Context(), metrics.StageDecode, time.Since(decodeStart))
+		observeStageError(r.Context(), metrics.StageDecode)
 		logger.Error(err, "failed to flush cached token response writer")
 		decodeSpan.SetStatus(codes.Error, "failed to flush cached token response writer")
 		return
 	}
 
 	decodeDuration := time.Since(decodeStart)
-	metrics.RecordDecodeDuration(decodeDuration)
+	observeStageDuration(r.Context(), metrics.StageDecode, decodeDuration)
 	if decodeStatus.failed() {
-		metrics.RecordError(metrics.StageDecode)
+		observeStageError(r.Context(), metrics.StageDecode)
 		decodeSpan.SetStatus(codes.Error, "decode request failed")
 	}
 	decodeSpan.SetAttributes(semconv.LLMDPDProxyDecodeDurationMs(float64(decodeDuration.Milliseconds())))
@@ -547,7 +550,7 @@ func decodeResponseWriter(w http.ResponseWriter, cachedTokens int, rewrite, stre
 // two upstream calls in parallel so decode's block allocation overlaps prefill.
 func (s *Server) runNIXLProtocolV2WriteParallel(
 	w http.ResponseWriter, r *http.Request, original []byte,
-	body map[string]any, uuidStr, transferID, prefillPodHostPort, kvCacheSource string,
+	body map[string]any, uuidStr, transferID, prefillPodHostPort string, source *kvSource,
 	apiType reqcommon.APIType,
 ) {
 	toolFields, _ := captureInferenceToolCallingRequest(r, apiType, original)
@@ -616,13 +619,13 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		}
 	}
 	// Compose the OffloadingConnector p2p pull onto the NIXL prefill request.
-	s.addP2PPullToPrefill(logger, prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), kvCacheSource, prefillPodHostPort)
+	addP2PPullToPrefill(prefillRequest[reqcommon.FieldKVTransferParams].(map[string]any), source)
 
 	reqcommon.CapSingleToken(prefillRequest, apiType)
 
 	pbody, err := json.Marshal(prefillRequest)
 	if err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
+		if err := errorJSONInvalid(w, r, err); err != nil {
 			logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal P)")
 		}
 		return
@@ -674,7 +677,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 
 	dbody, err := json.Marshal(body)
 	if err != nil {
-		if err := errorJSONInvalid(err, w); err != nil {
+		if err := errorJSONInvalid(w, r, err); err != nil {
 			logger.Error(err, "failed to send error response to client (concurrent-dispatch marshal D)")
 		}
 		return
@@ -683,7 +686,8 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// ---------- Fire prefill + decode in parallel ----------
 	prefillHandler, err := s.prefillerProxyHandler(prefillPodHostPort)
 	if err != nil {
-		if err := errorBadGateway(err, w); err != nil {
+		logger.Error(err, "failed to create prefill handler (concurrent-dispatch)")
+		if err := errorBadGateway(w, r); err != nil {
 			logger.Error(err, "failed to send error response to client (concurrent-dispatch P handler init)")
 		}
 		return
@@ -759,6 +763,9 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 				if rec != http.ErrAbortHandler {
 					panic(rec)
 				}
+				if pCtx.Err() != nil {
+					return
+				}
 				prefillSpan.SetStatus(codes.Error, "prefill handler aborted")
 				cancel()
 				log.FromContext(pCtx).Error(nil, "concurrent-dispatch prefill handler aborted",
@@ -769,12 +776,12 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		prefillHandler.ServeHTTP(pw, preq)
 		prefillResp = pw
 		prefillDuration := time.Since(prefillStartedAt)
-		metrics.RecordPrefillDuration(prefillDuration)
+		observeStageDuration(r.Context(), metrics.StagePrefill, prefillDuration)
 		prefillSpan.SetAttributes(
 			semconv.LLMDPDProxyPrefillStatusCode(pw.statusCode),
 			semconv.LLMDPDProxyPrefillDurationMs(float64(prefillDuration.Milliseconds())),
 		)
-		if isHTTPError(pw.statusCode) {
+		if isHTTPError(pw.statusCode) && pCtx.Err() == nil {
 			prefillSpan.SetStatus(codes.Error, "prefill request failed")
 			cancel() // KV will never arrive -> abort decode instead of hanging
 			log.FromContext(pCtx).Error(nil, "concurrent-dispatch prefill returned error status",
@@ -836,60 +843,73 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// Set when the KV-wait timer fired; decode then ran for the full timeout.
 	decodeTimedOut := false
 
-	select {
-	case <-prefillDone:
-		if prefillResp != nil && !isHTTPError(prefillResp.statusCode) {
-			// Prefill succeeded: commit decode's buffered response and stream on.
-			if !dcw.commit() {
-				logger.Error(nil, "concurrent-dispatch: decode aborted before prefill-success commit",
-					"request_id", uuidStr)
+	for decodeFinished := decodeDone; ; {
+		select {
+		case <-decodeFinished:
+			if dispatchCtx.Err() != nil || !decodeAborted.Load() && !dcw.failed() {
+				// Prefill can cancel decode before prefillDone closes.
+				// A successful decode also waits for prefill's outcome.
+				decodeFinished = nil
+				continue
 			}
-			break
-		}
-		// Prefill failed: abort decode and return the prefill error verbatim.
-		cancel()
-		dcw.abort()
-		metrics.RecordError(metrics.StagePrefill)
-		status := http.StatusBadGateway
-		if prefillResp != nil {
-			status = prefillResp.statusCode
-			for key, values := range prefillResp.Header() {
-				for _, v := range values {
-					w.Header().Add(key, v)
+			cancel()
+			if !decodeAborted.Load() {
+				dcw.commit()
+			}
+			<-prefillDone
+		case <-prefillDone:
+			if prefillResp != nil && !isHTTPError(prefillResp.statusCode) {
+				// Prefill succeeded: commit decode's buffered response and stream on.
+				if !dcw.commit() {
+					logger.Error(nil, "concurrent-dispatch: decode aborted before prefill-success commit",
+						"request_id", uuidStr)
+				}
+				break
+			}
+			// Prefill failed: abort decode and return the prefill error verbatim.
+			cancel()
+			dcw.abort()
+			observeStageError(r.Context(), metrics.StagePrefill)
+			status := http.StatusBadGateway
+			if prefillResp != nil {
+				status = prefillResp.statusCode
+				for key, values := range prefillResp.Header() {
+					for _, v := range values {
+						w.Header().Add(key, v)
+					}
 				}
 			}
-		}
-		bodyBytes := 0
-		if prefillResp != nil {
-			bodyBytes = prefillResp.buffer.Len()
-		}
-		logger.Info("concurrent-dispatch: prefill failed; returning prefill error and aborting decode",
-			"request_id", uuidStr, "p_status", status, logBodyBytesKey, bodyBytes)
-		clientResponded = true
-		w.WriteHeader(status)
-		if prefillResp != nil {
-			if _, writeErr := w.Write(prefillResp.bodyBytes()); writeErr != nil {
-				logger.Error(writeErr, "failed to send prefill error to client (concurrent-dispatch)")
+			bodyBytes := 0
+			if prefillResp != nil {
+				bodyBytes = prefillResp.buffer.Len()
 			}
+			logger.Info("concurrent-dispatch: prefill failed; returning prefill error and aborting decode",
+				"request_id", uuidStr, "p_status", status, logBodyBytesKey, bodyBytes)
+			clientResponded = true
+			w.WriteHeader(status)
+			if prefillResp != nil {
+				if _, writeErr := w.Write(prefillResp.bodyBytes()); writeErr != nil {
+					logger.Error(writeErr, "failed to send prefill error to client (concurrent-dispatch)")
+				}
+			}
+		case <-timer.C:
+			// Prefill did not resolve within the backstop window: cancel both requests
+			// and fail rather than hang waiting for KV that may never arrive.
+			cancel()
+			dcw.abort()
+			// Counted here rather than from prefill's own outcome: the cancelled
+			// prefill may still come back 2xx if it completed as the timer fired.
+			observeStageError(r.Context(), metrics.StagePrefill)
+			decodeTimedOut = true
+			logger.Error(nil, "concurrent-dispatch: prefill did not complete within KV-wait timeout; aborting",
+				"request_id", uuidStr, "timeout", waitTimeout.String())
+			clientResponded = true
+			if writeErr := sendError(w, r, http.StatusGatewayTimeout, "decode aborted: prefill did not complete within the MoRI-IO parallel-dispatch KV-wait timeout"); writeErr != nil {
+				logger.Error(writeErr, "failed to send timeout error to client (concurrent-dispatch)")
+			}
+			<-prefillDone // let the cancelled prefill goroutine finish to avoid a leak
 		}
-	case <-timer.C:
-		// Prefill did not resolve within the backstop window: cancel both requests
-		// and fail rather than hang waiting for KV that may never arrive.
-		cancel()
-		dcw.abort()
-		// Counted here rather than from prefill's own outcome: the cancelled
-		// prefill may still come back 2xx if it completed as the timer fired.
-		metrics.RecordError(metrics.StagePrefill)
-		decodeTimedOut = true
-		logger.Error(nil, "concurrent-dispatch: prefill did not complete within KV-wait timeout; aborting",
-			"request_id", uuidStr, "timeout", waitTimeout.String())
-		clientResponded = true
-		w.Header().Set("Content-Type", "application/json")
-		w.WriteHeader(http.StatusGatewayTimeout)
-		if _, writeErr := w.Write([]byte(`{"error":"decode aborted: prefill did not complete within the MoRI-IO parallel-dispatch KV-wait timeout"}`)); writeErr != nil {
-			logger.Error(writeErr, "failed to send timeout error to client (concurrent-dispatch)")
-		}
-		<-prefillDone // let the cancelled prefill goroutine finish to avoid a leak
+		break
 	}
 
 	// Wait for decode to finish (streamed on success, or promptly aborted) so
@@ -902,12 +922,12 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 	// and the failure is counted as a prefill error. Decode duration is also
 	// sampled on the KV-wait timeout, where decode waited the full timeout.
 	if !clientResponded {
-		metrics.RecordDecodeDuration(decodeDuration)
+		observeStageDuration(r.Context(), metrics.StageDecode, decodeDuration)
 		if decodeAborted.Load() || dcw.failed() {
-			metrics.RecordError(metrics.StageDecode)
+			observeStageError(r.Context(), metrics.StageDecode)
 		}
 	} else if decodeTimedOut {
-		metrics.RecordDecodeDuration(decodeDuration)
+		observeStageDuration(r.Context(), metrics.StageDecode, decodeDuration)
 	}
 
 	if currentSpan := trace.SpanFromContext(parentCtx); currentSpan.SpanContext().IsValid() {
@@ -936,7 +956,7 @@ func (s *Server) runNIXLProtocolV2WriteParallel(
 		}
 		// Nothing was relayed, so the response is still ours to write. Returning
 		// without one would let net/http synthesise an empty 200.
-		if err := errorBadGateway(errDecodeAborted, w); err != nil {
+		if err := errorBadGateway(w, r); err != nil {
 			logger.Error(err, "failed to send decode abort error to client (concurrent-dispatch)")
 		}
 	}

@@ -105,9 +105,9 @@ func extractMMItems(logger logr.Logger, requestData map[string]any, apiType reqc
 			if !ok {
 				continue
 			}
-			partType, ok := partMap[reqcommon.FieldType].(string)
-			if !ok {
-				continue
+			partType, _ := partMap[reqcommon.FieldType].(string)
+			if apiType == reqcommon.APITypeChatCompletions {
+				partType = reqcommon.NormalizeChatPart(partMap)
 			}
 
 			if apiType == reqcommon.APITypeMessages {
@@ -318,7 +318,9 @@ func (s *Server) fanoutEncoder(
 // runPDPipeline finalizes the post-encoder request and dispatches it to the
 // configured P/D connector or directly to the decoder. The caller has already
 // generated requestID and merged any encoder-side metadata into
-// body. On JSON-marshal failure, runPDPipeline writes the error
+// body. p2p carries the prefill pod's P2P address and the pull source; its
+// body fields describe the body before the encoder ran and are not
+// forwarded. On JSON-marshal failure, runPDPipeline writes the error
 // response itself (matching the existing handler pattern) and returns.
 func (s *Server) runPDPipeline(
 	w http.ResponseWriter,
@@ -326,6 +328,7 @@ func (s *Server) runPDPipeline(
 	body map[string]any,
 	prefillEndPoint string,
 	requestID string,
+	p2p p2pRouting,
 	apiType reqcommon.APIType,
 ) {
 	logger := log.FromContext(r.Context())
@@ -335,7 +338,7 @@ func (s *Server) runPDPipeline(
 	modifiedBody, err := json.Marshal(body)
 	if err != nil {
 		logger.Error(err, "failed to marshal request after encoder", "requestID", requestID)
-		if writeErr := errorJSONInvalid(err, w); writeErr != nil {
+		if writeErr := errorJSONInvalid(w, r, err); writeErr != nil {
 			logger.Error(writeErr, "failed to send error response to client", "requestID", requestID)
 		}
 		return
@@ -362,10 +365,7 @@ func (s *Server) runPDPipeline(
 
 	if len(prefillEndPoint) > 0 {
 		logger.V(logging.DEBUG).Info("using P/D protocol after encoder", "prefiller", prefillEndPoint)
-		// The encoder path does not carry a KV cache source: the P2P prefix pull
-		// is not wired through encoder disaggregation. The empty source skips the
-		// p2p injection regardless of --enable-p2p-pull.
-		s.handlePDConnector(w, pdRequest, prefillEndPoint, "", apiType)
+		s.handlePDConnector(w, pdRequest, prefillEndPoint, p2pRouting{prefill: p2p.prefill, source: p2p.source}, apiType)
 		return
 	}
 
@@ -375,16 +375,20 @@ func (s *Server) runPDPipeline(
 	decodeStart := time.Now()
 	decodeWriter, decodeStatus := captureResponseStatus(w)
 	decodeReturned := false
-	defer recordDecodeAbort(&decodeReturned, decodeStart)
+	defer recordDecodeAbort(r.Context(), &decodeReturned, decodeStart)
 	if !s.forwardDataParallel || !s.dataParallelHandler(decodeWriter, pdRequest, func() {
 		_, _ = toolFields.compareValidatedDispatched(modifiedBody)
 	}) {
-		_, _ = toolFields.compareValidatedDispatched(modifiedBody)
-		s.decoderProxy.ServeHTTP(decodeWriter, pdRequest)
+		if p2p.source != nil {
+			s.decodeWithP2PSource(decodeWriter, pdRequest, p2pRouting{source: p2p.source, body: body, raw: modifiedBody})
+		} else {
+			_, _ = toolFields.compareValidatedDispatched(modifiedBody)
+			s.decoderProxy.ServeHTTP(decodeWriter, pdRequest)
+		}
 	}
 	decodeReturned = true
-	metrics.RecordDecodeDuration(time.Since(decodeStart))
+	observeStageDuration(r.Context(), metrics.StageDecode, time.Since(decodeStart))
 	if decodeStatus.failed() {
-		metrics.RecordError(metrics.StageDecode)
+		observeStageError(r.Context(), metrics.StageDecode)
 	}
 }

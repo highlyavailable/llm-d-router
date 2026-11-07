@@ -63,10 +63,12 @@ epp:
   #     maxUnavailable: 1
   #     maxSurge: 0
 
-  # PodDisruptionBudget for the EPP Deployment. Disabled while unset; enabling it without a
+  # PodDisruptionBudget for EPP pods. Disabled while unset; enabling it without a
   # disruption field, or with both, fails the render, and minAvailable >= 1 with fewer than 2
-  # effective replicas (replicas, or autoscaling.minReplicas when autoscaled) also fails: a
-  # single-replica Deployment with minAvailable: 1 can never satisfy its budget, so every
+  # effective replicas (replicas, autoscaling.minReplicas when autoscaled,
+  # preferredReplicas + defaultReplicas with GKE preferredBackends, or
+  # primaryReplicas + standbyReplicas with priorityRouting) also fails: a
+  # single-replica workload with minAvailable: 1 can never satisfy its budget, so every
   # voluntary disruption -- node drains above all -- blocks until the timeout. The EPP pod in
   # sidecar proxy mode is governed by THIS budget alone; the proxy needs no separate one.
   #
@@ -150,8 +152,15 @@ epp:
     # behavior: {}
     # metrics: [] # Optional custom metrics override. Replaces auto-generated CPU and memory metrics (percentage fields are still range-validated if defined).
 
+  nodeSelector: {}
   affinity: {}
   tolerations: []
+  # Each constraint needs a labelSelector matching the EPP pods, for example
+  # llm-d-router-standalone: <release>-epp (llm-d-router-gateway: <release>-epp in the gateway chart).
+  topologySpreadConstraints: []
+  priorityClassName: ""
+  # Extra labels added to the EPP pod template. Chart-owned label keys are rejected.
+  podLabels: {}
 
   # Annotations added to the EPP pod template. Useful for clusters that rely on
   # annotation-based Prometheus scraping (prometheus.io/{scrape,port,path}) or
